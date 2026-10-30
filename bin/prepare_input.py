@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Reference build: validate the benchmark CSV and write sequences.fasta + manifest.tsv.
 
-Stops with the offending line on: wrong header, empty/duplicate/whitespace-containing ID,
-a residue outside the 20 canonical amino acids, or a sequence longer than ESM-2's limit.
+The CSV needs a sequence_id and a sequence column, in any position; other columns are ignored.
+Stops with the offending line on: a missing or duplicated required column, a row whose column
+count differs from the header, an empty/duplicate/whitespace-containing ID, a residue outside
+the 20 canonical amino acids, or a sequence longer than ESM-2's limit.
 With --check the input is validated and nothing is written.
 """
 
@@ -13,7 +15,7 @@ import statistics
 import sys
 from pathlib import Path
 
-HEADER = ["sequence_id", "sequence"]
+REQUIRED_COLUMNS = ["sequence_id", "sequence"]
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 MAX_LEN = 1022  # ESM-2 has 1024 positions, two of which hold BOS/EOS
 MIN_SEQUENCES = 12  # compare_embeddings.py: kNN overlap at k = 10 needs k + 2 sequences
@@ -28,15 +30,19 @@ def read_records(path):
     with open(path, newline="", encoding="utf-8-sig") as fh:
         rows = csv.reader(fh)
         header = [cell.strip() for cell in next(rows, [])]
-        if header != HEADER:
-            fail(f"{path}: line 1: expected header {','.join(HEADER)!r}, got {','.join(header)!r}")
+        for column in REQUIRED_COLUMNS:
+            if header.count(column) != 1:
+                problem = "missing" if column not in header else "appears more than once"
+                fail(f"{path}: line 1: column {column!r} {problem}; header is {','.join(header)!r}")
+        id_col, seq_col = header.index("sequence_id"), header.index("sequence")
         for row in rows:
             line = rows.line_num
             if not any(cell.strip() for cell in row):
                 continue
-            if len(row) != 2:
-                fail(f"line {line}: expected 2 columns, got {len(row)}")
-            seq_id, seq = row[0].strip(), row[1].strip()
+            # A count mismatch usually means an unquoted comma, which would shift the columns.
+            if len(row) != len(header):
+                fail(f"line {line}: expected {len(header)} columns like the header, got {len(row)}")
+            seq_id, seq = row[id_col].strip(), row[seq_col].strip()
             if not seq_id or len(seq_id.split()) != 1:
                 fail(f"line {line}: sequence_id must be non-empty and contain no whitespace, got {seq_id!r}")
             if seq_id in first_seen:
@@ -63,7 +69,7 @@ def write_atomic(path, text):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--csv", required=True, help="input CSV with columns sequence_id,sequence")
+    ap.add_argument("--csv", required=True, help="input CSV with sequence_id and sequence columns")
     ap.add_argument("--outdir", help="where to write sequences.fasta and manifest.tsv")
     ap.add_argument("--check", action="store_true", help="validate only, write nothing")
     args = ap.parse_args()
