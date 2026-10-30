@@ -37,6 +37,11 @@ fetch() {  # download a URL to stdout
   if type -P curl >/dev/null; then curl -fsSL "$1"; else wget -qO- "$1"; fi
 }
 
+# For out="$(capture cmd ...)" || die "...": stdout+stderr of cmd, keeping its exit status.
+# Without the trap reset the inherited ERR trap fires inside the subshell first and logs a
+# misleading "command failed" line before the caller's own message.
+capture() { trap - ERR; "$@" 2>&1; }
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -258,21 +263,21 @@ check_tools() {
       || die "$tool resolves to $(type -P "$tool"), not $CORE_PREFIX/bin/$tool"
   done
   [[ -x $JAVA_HOME/bin/java ]] || die "JAVA_HOME=$JAVA_HOME has no bin/java"
-  java_out="$("$JAVA_HOME/bin/java" -version 2>&1)" || die "java at $JAVA_HOME does not start: $java_out"
-  out="$(nextflow -version 2>&1)" || die "nextflow does not start (JAVA_HOME=$JAVA_HOME): $out"
+  java_out="$(capture "$JAVA_HOME/bin/java" -version)" || die "java at $JAVA_HOME does not start: $java_out"
+  out="$(capture nextflow -version)" || die "nextflow does not start (JAVA_HOME=$JAVA_HOME): $out"
   log "tools: nextflow $(awk '$1 == "version" { print $2; exit }' <<<"$out"), $(head -n1 <<<"$java_out")"
 
-  out="$("$ESM2_PREFIX/bin/python" -c '
+  out="$(capture "$ESM2_PREFIX/bin/python" -c '
 import torch, esm, esm.pretrained
 esm.pretrained.esm2_t33_650M_UR50D  # attribute only exists in fair-esm, not in EvolutionaryScale esm
-print(f"torch {torch.__version__}, fair-esm {esm.__version__}")' 2>&1)" \
+print(f"torch {torch.__version__}, fair-esm {esm.__version__}")')" \
     || die "env $ESM2_ENV: torch/fair-esm import check failed: $out"
   log "env $ESM2_ENV: $(tail -n1 <<<"$out")"
 
-  out="$("$ESMC_PREFIX/bin/python" -c '
+  out="$(capture "$ESMC_PREFIX/bin/python" -c '
 import torch, esm
 from esm.models.esmc import EsmcModel, EsmcTokenizer
-print(f"torch {torch.__version__}, esm {esm.__version__}")' 2>&1)" \
+print(f"torch {torch.__version__}, esm {esm.__version__}")')" \
     || die "env $ESMC_ENV: torch/esm import check failed: $out"
   log "env $ESMC_ENV: $(tail -n1 <<<"$out")"
 }
@@ -352,17 +357,25 @@ fi
 # ---------------------------------------------------------------------------
 check_cuda() {  # $1 = env name, $2 = env prefix
   local out driver
-  if out="$("$2/bin/python" -c 'import torch; print(torch.version.cuda); assert torch.cuda.is_available()' 2>&1)"; then
+  if out="$(capture "$2/bin/python" -c 'import torch; print(torch.version.cuda); assert torch.cuda.is_available()')"; then
     return 0
   fi
-  driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1)"
+  driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
   die "env $1: torch (built for CUDA $(head -n1 <<<"$out")) cannot use the GPU (driver ${driver:-unknown}). Set TORCH_INDEX_URL to a matching wheel index, e.g. https://download.pytorch.org/whl/cu126, and re-run; the env rebuilds automatically."
 }
 
 DEVICE=cuda
 log "[5/5] pipeline"
-if type -P nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
-  log "GPU: $(nvidia-smi -L | head -n1) ($(nvidia-smi -L | wc -l | tr -d ' ') visible)"
+# nvidia-smi -L can exit 0 while printing "No devices found." (driver installed, no GPU allocated
+# to this job), so count the "GPU N: ..." lines instead of trusting the exit status.
+GPU_LIST="" SMI_STATUS="nvidia-smi not found"
+if type -P nvidia-smi >/dev/null; then
+  SMI_OUT="$(nvidia-smi -L 2>&1 || true)"
+  GPU_LIST="$(awk '/^GPU [0-9]+:/' <<<"$SMI_OUT")"
+  SMI_STATUS="nvidia-smi -L: $(head -n1 <<<"$SMI_OUT")"
+fi
+if [[ -n $GPU_LIST ]]; then
+  log "GPU: $(head -n1 <<<"$GPU_LIST") ($(wc -l <<<"$GPU_LIST" | tr -d ' ') visible)"
   if [[ $ENVS_READY == 1 ]]; then
     check_cuda "$ESM2_ENV" "$ESM2_PREFIX"
     check_cuda "$ESMC_ENV" "$ESMC_PREFIX"
@@ -371,9 +384,9 @@ elif [[ ${ESM_BENCH_ALLOW_CPU:-0} == 1 ]]; then
   DEVICE=cpu
   log "WARNING: no GPU visible; running on CPU because ESM_BENCH_ALLOW_CPU=1"
 elif [[ $DRY_RUN == 1 ]]; then
-  log "GPU: none visible here; a real run would stop at this point (expected on a login node)"
+  log "GPU: none visible here ($SMI_STATUS); a real run would stop at this point (expected on a login node)"
 else
-  die "no NVIDIA GPU visible (nvidia-smi missing or failing). Request one in your sbatch script (e.g. #SBATCH --gres=gpu:1) or set ESM_BENCH_ALLOW_CPU=1."
+  die "no NVIDIA GPU visible to this job ($SMI_STATUS). On SLURM this usually means the job did not request one: add e.g. '#SBATCH --gres=gpu:1' (or '--gpus=1') and use a GPU partition. To run on CPU instead, set ESM_BENCH_ALLOW_CPU=1."
 fi
 
 RESUME=(-resume)
