@@ -13,7 +13,8 @@
 #                                       --precision bf16 --max_tokens 4096 --outdir results_bf16
 #
 # Environment overrides:
-#   INPUT_CSV              input CSV (default: esm_sequences.csv next to this script)
+#   INPUT_CSV              input CSV with header sequence_id,sequence (default: esm_sequences.csv next to
+#                          this script; a relative path is taken from the directory you run the script in)
 #   TORCH_INDEX_URL        pip index for torch, e.g. https://download.pytorch.org/whl/cu126 for older drivers
 #   MICROMAMBA_VERSION     micromamba release to bootstrap when no micromamba/conda exists (default: latest)
 #   ESM_BENCH_ALLOW_CPU=1  run on CPU instead of failing when no GPU is visible

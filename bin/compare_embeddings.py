@@ -369,8 +369,9 @@ def write_summary(path, m):
         "",
         "- CKA and RSA compare geometry, so they work across the different widths (1280 vs 1152). "
         "1 means the same geometry up to rotation and scale.",
-        "- Linear CKA on 100 mean-pooled vectors is biased upward because n < d. Read it against its "
-        "permutation null, or use the debiased value.",
+        f"- Linear CKA on {m['input']['n_sequences']} mean-pooled vectors is biased upward unless n is much "
+        "larger than the embedding width (1152–1280). Read it against its permutation null, or use the "
+        "debiased value.",
         "- Random sequences carry no evolutionary signal: shared structure comes from length, composition "
         "and residue identity. The partial RSA shows how much agreement is left after removing length "
         "and composition.",

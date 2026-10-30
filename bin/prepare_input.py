@@ -16,6 +16,7 @@ from pathlib import Path
 HEADER = ["sequence_id", "sequence"]
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 MAX_LEN = 1022  # ESM-2 has 1024 positions, two of which hold BOS/EOS
+MIN_SEQUENCES = 12  # compare_embeddings.py: kNN overlap at k = 10 needs k + 2 sequences
 
 
 def fail(msg):
@@ -49,8 +50,8 @@ def read_records(path):
                 fail(f"line {line}: {seq_id}: length {len(seq)} exceeds the ESM-2 limit of {MAX_LEN}")
             first_seen[seq_id] = line
             records.append((seq_id, seq))
-    if not records:
-        fail(f"{path}: no sequences")
+    if len(records) < MIN_SEQUENCES:
+        fail(f"{path}: {len(records)} sequences; the comparison needs at least {MIN_SEQUENCES}")
     return records
 
 
