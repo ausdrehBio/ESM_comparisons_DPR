@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Embed every sequence of a FASTA file with ESM-2 650M or ESM-C 600M.
+"""Embed every sequence of a FASTA file (one shard) with ESM-2 650M or ESM-C 600M.
 
 Both models share batching, pooling, checks and output format; only model loading and
 tokenisation differ, so each adapter imports its own package lazily and the script runs in
 either model env. Embeddings are the final-layer, post-LayerNorm hidden states of the
 residue positions (BOS/EOS/padding excluded); the sequence embedding is their mean.
+Per-residue embeddings are kept only for the residues listed in --residue_sample.
 
-Writes <outdir>/embeddings.npz (ids, lengths, offsets, mean, per_residue) and <outdir>/meta.json.
+Writes <outdir>/embeddings.npz (ids, lengths, mean, residue_rows, per_residue) and
+<outdir>/meta.json; residue_rows are the rows of residue_sample.tsv held in per_residue.
 """
 
 import argparse
@@ -113,6 +115,23 @@ def read_fasta(path):
     return records
 
 
+def read_residue_sample(path, records):
+    """The residue-sample rows that fall in these records: {sequence_id: [(row, position), ...]}."""
+    seq_of = dict(records)
+    picks = {}
+    with open(path) as fh:
+        next(fh)  # header
+        for row, line in enumerate(fh):
+            sid, pos, aa = line.rstrip("\n").split("\t")
+            if sid not in seq_of:
+                continue
+            pos = int(pos)
+            if pos >= len(seq_of[sid]) or seq_of[sid][pos] != aa:
+                sys.exit(f"embed: residue sample row {row} ({sid} position {pos} = {aa}) does not match the FASTA")
+            picks.setdefault(sid, []).append((row, pos))
+    return picks
+
+
 def make_batches(records, max_tokens):
     """Group record indices longest-first so each padded batch (incl. BOS/EOS) fits max_tokens."""
     order = sorted(range(len(records)), key=lambda i: len(records[i][1]), reverse=True)
@@ -134,24 +153,28 @@ def residue_states(adapter, seqs):
         if tokens[row, 0] != adapter.bos or tokens[row, len(seq) + 1] != adapter.eos:
             sys.exit(f"embed: unexpected token layout for a length-{len(seq)} sequence; expected BOS seq EOS pad")
     with torch.inference_mode():
-        hidden = adapter.hidden(tokens)
-    return [hidden[row, 1 : len(seq) + 1].float().cpu().numpy() for row, seq in enumerate(seqs)]
+        hidden = adapter.hidden(tokens).float().cpu().numpy()
+    return [hidden[row, 1 : len(seq) + 1] for row, seq in enumerate(seqs)]
 
 
-def padding_check(adapter, records, batches, per_residue, min_cosine):
-    """Re-embed the most-padded sequence alone; padding must not change its embedding."""
-    worst = (None, 0, 0)  # index, padding, padded length
+def most_padded(records, batches):
+    """(index, padding, padded length) of the sequence with the most padding in its batch."""
+    worst = (None, 0, 0)
     for batch in batches:
         width = max(len(records[i][1]) for i in batch)
         for i in batch:
             if width - len(records[i][1]) > worst[1]:
                 worst = (i, width - len(records[i][1]), width)
+    return worst
+
+
+def padding_check(adapter, records, worst, batched, min_cosine):
+    """Re-embed the most-padded sequence alone; padding must not change its embedding."""
     i, padding, width = worst
     if i is None:
         return {"skipped": "no sequence was padded"}
 
     alone = residue_states(adapter, [records[i][1]])[0]
-    batched = per_residue[i]
     cosine = (alone * batched).sum(1) / (np.linalg.norm(alone, axis=1) * np.linalg.norm(batched, axis=1))
     result = {
         "sequence_id": records[i][0],
@@ -174,6 +197,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, choices=sorted(ADAPTERS))
     ap.add_argument("--fasta", required=True)
+    ap.add_argument("--residue_sample", required=True, help="residue_sample.tsv from the reference build")
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--precision", default="fp32", choices=sorted(DTYPES))
@@ -190,53 +214,70 @@ def main():
     records = read_fasta(args.fasta)
     if not records:
         sys.exit(f"embed: no sequences in {args.fasta}")
+    picks = read_residue_sample(args.residue_sample, records)
+    slot, residue_rows = {}, []  # where each sequence's sampled residues go in per_residue
+    for sid, _ in records:
+        if sid in picks:
+            slot[sid] = len(residue_rows)
+            residue_rows += [row for row, _ in picks[sid]]
     batches = make_batches(records, args.max_tokens)
+    worst = most_padded(records, batches)
 
     t0 = time.perf_counter()
     adapter = ADAPTERS[args.model](args.device, DTYPES[args.precision])
     sync(args.device)
     load_s = time.perf_counter() - t0
 
+    # Filled in place: a shard's outputs are held once, never as a list plus a concatenated copy.
+    dim = EXPECTED_DIM[args.model]
+    mean = np.empty((len(records), dim), dtype=np.float32)
+    per_residue = np.empty((len(residue_rows), dim), dtype=np.float32)
+    worst_state = None
     if args.device == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    per_residue = [None] * len(records)
+    report_every = max(1, len(batches) // 20)
     t0 = time.perf_counter()
     for n, batch in enumerate(batches, 1):
         states = residue_states(adapter, [records[i][1] for i in batch])
         for i, state in zip(batch, states):
-            per_residue[i] = state
-        print(f"embed: {args.model}: batch {n}/{len(batches)} ({len(batch)} sequences)", file=sys.stderr)
+            if state.shape[1] != dim:
+                sys.exit(f"embed: {args.model} produced dim {state.shape[1]}, expected {dim}")
+            mean[i] = state.mean(0)
+            sid = records[i][0]
+            if sid in picks:
+                positions = [pos for _, pos in picks[sid]]
+                per_residue[slot[sid] : slot[sid] + len(positions)] = state[positions]
+            if i == worst[0]:
+                worst_state = state.copy()
+        if n % report_every == 0 or n == len(batches):
+            print(f"embed: {args.model}: batch {n}/{len(batches)}", file=sys.stderr)
     sync(args.device)
     embed_s = time.perf_counter() - t0
     peak_gb = torch.cuda.max_memory_allocated() / 1e9 if args.device == "cuda" else None
 
-    padding = padding_check(adapter, records, batches, per_residue, PADDING_MIN_COSINE[args.precision])
+    padding = padding_check(adapter, records, worst, worst_state, PADDING_MIN_COSINE[args.precision])
+    if not (np.isfinite(mean).all() and np.isfinite(per_residue).all()):
+        sys.exit("embed: non-finite embeddings")
 
     lengths = np.array([len(seq) for _, seq in records], dtype=np.int64)
-    offsets = np.concatenate([[0], np.cumsum(lengths)])
-    residues = np.concatenate(per_residue).astype(np.float32)
-    mean = np.stack([state.mean(0) for state in per_residue]).astype(np.float32)
-    if mean.shape[1] != EXPECTED_DIM[args.model]:
-        sys.exit(f"embed: {args.model} produced dim {mean.shape[1]}, expected {EXPECTED_DIM[args.model]}")
-    if residues.shape[0] != offsets[-1] or not np.isfinite(residues).all():
-        sys.exit("embed: per-residue embeddings are inconsistent or non-finite")
-
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     np.savez(
         outdir / "embeddings.npz",
         ids=np.array([sid for sid, _ in records]),
         lengths=lengths,
-        offsets=offsets,
         mean=mean,
-        per_residue=residues,
+        residue_rows=np.array(residue_rows, dtype=np.int64),
+        per_residue=per_residue,
     )
     meta = {
         "model": args.model,
         **adapter.info,
-        "embedding_dim": int(mean.shape[1]),
+        "embedding_dim": dim,
+        "shard": Path(args.fasta).name,
         "n_sequences": len(records),
-        "n_residues": int(offsets[-1]),
+        "n_residues": int(lengths.sum()),
+        "n_sampled_residues": len(residue_rows),
         "precision": args.precision,
         "device": args.device,
         "gpu": torch.cuda.get_device_name(0) if args.device == "cuda" else None,
@@ -248,13 +289,13 @@ def main():
         "n_batches": len(batches),
         "load_seconds": round(load_s, 3),
         "embed_seconds": round(embed_s, 3),
-        "residues_per_second": round(int(offsets[-1]) / embed_s, 1),
+        "residues_per_second": round(int(lengths.sum()) / embed_s, 1),
         "peak_gpu_memory_gb": round(peak_gb, 3) if peak_gb is not None else None,
         "padding_check": padding,
     }
     (outdir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     print(
-        f"embed: {args.model}: {len(records)} sequences, d={mean.shape[1]}, "
+        f"embed: {args.model} {meta['shard']}: {len(records)} sequences, d={dim}, "
         f"load {load_s:.1f}s, embed {embed_s:.1f}s, padding check {padding}",
         file=sys.stderr,
     )

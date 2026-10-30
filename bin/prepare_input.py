@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
-"""Reference build: validate the benchmark CSV and write sequences.fasta + manifest.tsv.
+"""Reference build: validate the benchmark CSV and write the pipeline's inputs.
 
 The CSV needs a sequence_id and a sequence column, in any position; other columns are ignored.
 Stops with the offending line on: a missing or duplicated required column, a row whose column
 count differs from the header, an empty/duplicate/whitespace-containing ID, a residue outside
 the 20 canonical amino acids, or a sequence longer than ESM-2's limit.
+
+Writes to --outdir:
+  sequences.fasta       all sequences, in input order
+  manifest.tsv          sequence_id, length and amino-acid composition per sequence
+  shards/shard_*.fasta  the same sequences in chunks of SHARD_SIZE. Each shard is one EMBED task
+                        per model, so -resume keeps finished shards when a long run is interrupted
+  residue_sample.tsv    residues whose per-residue embeddings are kept (sequence_id, 0-based
+                        position, amino_acid): all of them for small inputs, otherwise a fixed-seed
+                        random sample, so both models store exactly the same residues
+A file whose content is unchanged is not rewritten, so its timestamp, which Nextflow's -resume
+cache checks, only changes when its content does.
 With --check the input is validated and nothing is written.
 """
 
 import argparse
+import bisect
 import csv
 import os
+import random
 import statistics
 import sys
 from pathlib import Path
@@ -19,6 +32,9 @@ REQUIRED_COLUMNS = ["sequence_id", "sequence"]
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 MAX_LEN = 1022  # ESM-2 has 1024 positions, two of which hold BOS/EOS
 MIN_SEQUENCES = 12  # compare_embeddings.py: kNN overlap at k = 10 needs k + 2 sequences
+SHARD_SIZE = 25_000  # sequences per EMBED task: an interrupted run loses at most one shard per model
+RESIDUE_SAMPLE = 200_000  # per-residue embeddings kept per model (~1 GB in fp32)
+SEED = 0
 
 
 def fail(msg):
@@ -61,16 +77,37 @@ def read_records(path):
     return records
 
 
-def write_atomic(path, text):
+def sample_residues(records):
+    """(sequence index, position) pairs in sequence order: every residue, or RESIDUE_SAMPLE of them."""
+    offsets = [0]
+    for _, seq in records:
+        offsets.append(offsets[-1] + len(seq))
+    total = offsets[-1]
+    picks = range(total) if total <= RESIDUE_SAMPLE else sorted(random.Random(SEED).sample(range(total), RESIDUE_SAMPLE))
+    pairs = []
+    for flat in picks:
+        i = bisect.bisect_right(offsets, flat) - 1
+        pairs.append((i, flat - offsets[i]))
+    return pairs
+
+
+def fasta(records):
+    return "".join(f">{sid}\n{seq}\n" for sid, seq in records)
+
+
+def write_if_changed(path, text):
+    """Atomic write that leaves an identical existing file, and its timestamp, untouched."""
+    if path.exists() and path.read_text() == text:
+        return
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
     os.replace(tmp, path)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--csv", required=True, help="input CSV with sequence_id and sequence columns")
-    ap.add_argument("--outdir", help="where to write sequences.fasta and manifest.tsv")
+    ap.add_argument("--outdir", help="where to write the outputs listed above")
     ap.add_argument("--check", action="store_true", help="validate only, write nothing")
     args = ap.parse_args()
     if not args.check and not args.outdir:
@@ -79,22 +116,42 @@ def main():
     records = read_records(args.csv)
     lengths = [len(seq) for _, seq in records]
     print(
-        f"prepare_input: {len(records)} valid sequences, length {min(lengths)}-{max(lengths)} "
-        f"(median {statistics.median(lengths):g})",
+        f"prepare_input: {len(records)} valid sequences, {sum(lengths)} residues, length "
+        f"{min(lengths)}-{max(lengths)} (median {statistics.median(lengths):g})",
         file=sys.stderr,
     )
     if args.check:
         return
 
     outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    write_atomic(outdir / "sequences.fasta", "".join(f">{sid}\n{seq}\n" for sid, seq in records))
+    shard_dir = outdir / "shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    write_if_changed(outdir / "sequences.fasta", fasta(records))
 
     lines = ["\t".join(["sequence_id", "length"] + [f"frac_{aa}" for aa in AMINO_ACIDS])]
     for sid, seq in records:
         fracs = [f"{seq.count(aa) / len(seq):.6f}" for aa in AMINO_ACIDS]
         lines.append("\t".join([sid, str(len(seq))] + fracs))
-    write_atomic(outdir / "manifest.tsv", "\n".join(lines) + "\n")
+    write_if_changed(outdir / "manifest.tsv", "\n".join(lines) + "\n")
+
+    shard_names = set()
+    for k, start in enumerate(range(0, len(records), SHARD_SIZE)):
+        name = f"shard_{k:05d}.fasta"
+        shard_names.add(name)
+        write_if_changed(shard_dir / name, fasta(records[start : start + SHARD_SIZE]))
+    for stale in shard_dir.glob("shard_*.fasta"):
+        if stale.name not in shard_names:
+            stale.unlink()
+
+    pairs = sample_residues(records)
+    lines = ["sequence_id\tposition\tamino_acid"]
+    lines += [f"{records[i][0]}\t{pos}\t{records[i][1][pos]}" for i, pos in pairs]
+    write_if_changed(outdir / "residue_sample.tsv", "\n".join(lines) + "\n")
+    print(
+        f"prepare_input: {len(shard_names)} shard(s) of up to {SHARD_SIZE} sequences; "
+        f"per-residue embeddings kept for {len(pairs)} of {sum(lengths)} residues",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

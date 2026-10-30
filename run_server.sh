@@ -11,6 +11,10 @@
 #   bash run_server.sh --download-only  everything except the pipeline (e.g. on a login node with internet)
 #   bash run_server.sh [nextflow args]  anything else goes to `nextflow run main.nf`, e.g.
 #                                       --precision bf16 --max_tokens 4096 --outdir results_bf16
+#                                       --pair_sample 5000 (sequences for all-vs-all metrics)
+#
+# Large inputs are embedded in shards of 25,000 sequences. If a run stops (e.g. at the SLURM
+# time limit), submitting the same command again resumes after the last finished shard.
 #
 # Environment overrides:
 #   INPUT_CSV              input CSV with sequence_id and sequence columns, others are ignored (default:
@@ -95,7 +99,7 @@ if [[ $DRY_RUN == 1 ]]; then log "dry run: nothing will be installed, downloaded
 # ---------------------------------------------------------------------------
 log "preflight: checking repository files in $SCRIPT_DIR"
 for f in main.nf nextflow.config envs/core.yml envs/esm2-requirements.txt envs/esmc-requirements.txt \
-         bin/prepare_input.py bin/download_models.py bin/embed.py bin/compare_embeddings.py; do
+         bin/prepare_input.py bin/download_models.py bin/embed.py bin/merge_shards.py bin/compare_embeddings.py; do
   [[ -f "$SCRIPT_DIR/$f" ]] || die "missing $f in $SCRIPT_DIR (incomplete clone?)"
 done
 [[ -s "$INPUT_CSV" ]] || die "input CSV missing or empty: $INPUT_CSV (override with INPUT_CSV=...)"
@@ -295,10 +299,18 @@ fi
 # ---------------------------------------------------------------------------
 # Reference build: CSV -> validated FASTA + manifest
 # ---------------------------------------------------------------------------
+have_shards() {
+  local f
+  for f in "$REF_DIR"/shards/shard_*.fasta; do [[ -s $f ]] && return 0; done
+  return 1
+}
+
 build_reference() {
   local want stamp="$REF_DIR/input.sha256"
-  want="$(sha256 < "$INPUT_CSV")"
-  if [[ -s $REF_DIR/sequences.fasta && -s $REF_DIR/manifest.tsv && -f $stamp && "$(cat "$stamp")" == "$want" ]]; then
+  # The build script is part of the stamp: a changed shard size or residue sample rebuilds.
+  want="$(cat "$INPUT_CSV" bin/prepare_input.py | sha256)"
+  if [[ -s $REF_DIR/sequences.fasta && -s $REF_DIR/manifest.tsv && -s $REF_DIR/residue_sample.tsv ]] \
+     && have_shards && [[ -f $stamp && "$(cat "$stamp")" == "$want" ]]; then
     log "reference: $REF_DIR is up to date for $INPUT_CSV, skip"
     return 0
   fi
@@ -397,6 +409,7 @@ for arg in ${PASSTHRU[@]+"${PASSTHRU[@]}"}; do
 done
 NF_CMD=(nextflow run "$SCRIPT_DIR/main.nf" ${RESUME[@]+"${RESUME[@]}"}
         --input "$REF_DIR/sequences.fasta" --manifest "$REF_DIR/manifest.tsv"
+        --shards "$REF_DIR/shards" --residue_sample "$REF_DIR/residue_sample.tsv"
         --core_prefix "$CORE_PREFIX" --esm2_prefix "$ESM2_PREFIX" --esmc_prefix "$ESMC_PREFIX"
         --device "$DEVICE" ${PASSTHRU[@]+"${PASSTHRU[@]}"})
 
