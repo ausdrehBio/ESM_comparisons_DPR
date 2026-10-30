@@ -1,0 +1,13 @@
+# Orchestration + analysis env (esm_bench_core). The env name is set by run_server.sh.
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.12
+  - openjdk=17
+  - nextflow=25.04
+  - numpy=2.2
+  - pandas=2.2
+  - scipy=1.15
+  - matplotlib-base=3.10

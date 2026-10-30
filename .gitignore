@@ -1,0 +1,23 @@
+# Created by run_server.sh: bootstrap, caches, reference build, model markers
+.micromamba/
+.cache/
+.nxf_home/
+data/
+
+# Nextflow: run metadata (.nextflow/, .nextflow.log*, .nextflow.pid), task work dirs, outputs
+.nextflow*
+work/
+results*/
+
+# SLURM job logs written next to the submission script
+slurm-*.out
+slurm-*.err
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

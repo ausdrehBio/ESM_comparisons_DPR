@@ -1,0 +1,3 @@
+# ESM-2 650M env (esm_bench_esm2). torch is installed first by run_server.sh (TORCH_SPEC).
+fair-esm==2.0.0
+numpy>=1.26,<3
